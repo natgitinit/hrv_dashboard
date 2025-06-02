@@ -1,144 +1,17 @@
-<!-- <script lang="ts">
-  import {
-    Chart,
-    Svg,
-    Group,
-    Circle,
-    ForceSimulation,
-  } from 'layerchart';
-
-  import {
-    forceX,
-    forceY,
-    forceManyBody,
-    forceCollide,
-    type SimulationNodeDatum,
-    type Simulation,
-  } from 'd3-force';
-
-  import { onMount } from 'svelte';
-
-  // 🎨 Color palette
-  function groupColor(group: number) {
-    const colors = ['#00BCD4', '#4CAF50', '#FFC107', '#E91E63'];
-    return colors[group % colors.length];
-  }
-
-  // 🧠 Node data with radius and position
-  let nodes: (SimulationNodeDatum & {
-    id: number;
-    group: number;
-    r: number;
-    x: number;
-    y: number;
-  })[] = Array.from({ length: 7 }, (_, i) => ({
-    id: i,
-    group: 1,
-    r: i === 0 ? 10 : 10 + Math.random() * 5,
-    x: 400,
-    y: 400,
-  }));
-
-  // 🫀 RR state
-  let rr = 60;
-  let displayRR = rr;
-
-  // 📦 D3 simulation instance
-  let simulation: Simulation<SimulationNodeDatum>;
-
-  // 🔁 Fetch RR and update sim
-  async function fetchData() {
-  try {
-    const res = await fetch('http://localhost:8000/latest');
-    const data = await res.json();
-    console.log('📡 Data', data);
-    if (data.rr !== undefined) {
-      rr = data.rr;
-      displayRR += (rr - displayRR) * 0.1;
-
-      // Wait for simulation to be bound and valid
-      if (simulation?.force && typeof simulation.force === 'function') {
-        const chargeForce = simulation.force('charge');
-        if (chargeForce && typeof chargeForce.strength === 'function') {
-          chargeForce.strength((d, i) =>
-            i === 0 ? (-400 * 2) / 3 : (displayRR - 60) * 3
-          );
-          simulation.alpha(0.5).restart();
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Fetch error:', err);
-  }
-}
-
-
-  onMount(() => {
-    const interval = setInterval(fetchData, 2000);
-    return () => clearInterval(interval);
-  });
-</script> -->
-
-
-<!-- <div class="h-[800px] bg-white p-4 border border-gray-300 rounded shadow overflow-hidden">
-  <Chart data={nodes} let:width let:height>
-    <Svg width={width} height={height} class="bg-sky-100 border border-blue-400">
-      <ForceSimulation
-      bind:this={simulation}
-        forces={{
-          x: forceX(() => width / 2).strength(0.05),
-          y: forceY(() => height / 2).strength(0.05),
-          collide: forceCollide<SimulationNodeDatum & { r: number }>()
-            .radius(d => d.r + 1)
-            .iterations(3),
-            charge: forceManyBody().strength((d, i) =>
-              i === 0 ? (-width * 2) / 3 : (displayRR - 60) * 3
-            ),
-        }}
-        alphaTarget={0.3}
-        velocityDecay={0.1}
-        let:nodes
-      >
-        <Group center>
-          {#each nodes as node, i}
-            <Circle
-              cx={node.x ?? 200}
-              cy={node.y ?? 200}
-              r={node.r}
-              fill={groupColor(node.group)}
-              opacity="0.8"
-            />
-          {/each}
-        </Group>
-
-        <rect
-          {width}
-          {height}
-          on:pointermove={(e) => {
-            nodes[0].fx = e.offsetX - width / 2;
-            nodes[0].fy = e.offsetY - height / 2;
-          }}
-          class="fill-transparent"
-        />
-      </ForceSimulation>
-    </Svg>
-  </Chart>
-</div> -->
-
-
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import * as d3 from 'd3';
 
   let rr = 60;
   let displayRR = 60;
   let svgContainer: SVGSVGElement;
-
+  let lastBeatTime = Date.now();
   const width = 1000;
   const height = 400;
-  const n = 100; // number of points per layer
-  let layers = 10;
+  const n = 50; // Number of points per layer
+  let layers = 8;
   let data: number[][] = [];
+  let offset = 0; // For shifting waves like a heart rate monitor
 
   // 🎨 Multiple color palettes based on RR zone
   const colorPalettes: string[][] = [
@@ -162,7 +35,10 @@
     return colorPalettes[4];
   }
 
-  // 💥 Create bump data
+  // Pulse speed matches heartbeat (e.g., 60 BPM = 1s per beat)
+  $: pulseSpeed = rr > 0 ? 60 / rr : 1;
+
+  // 💥 Create bump data for waves
   function bump(a: number[], n: number) {
     const x = 1 / (0.1 + Math.random());
     const y = 2 * Math.random() - 0.5;
@@ -179,35 +55,125 @@
     return a;
   }
 
+  // Define scales and elements globally so animate can access them
+  let x: d3.ScaleLinear<number, number>;
+  let y: d3.ScaleLinear<number, number>;
+  let area: d3.Area<[number, number]>;
+  let line: d3.Line<[number, number]>;
+  let paths: d3.Selection<SVGPathElement, d3.Series<number[], number>, SVGSVGElement, unknown>;
+  let pulseLine: d3.Selection<SVGPathElement, d3.Series<number[], number>, SVGSVGElement, unknown>;
+  let stack: d3.Stack<any, number[], number>;
+  let lastTime = performance.now();
+
+  function transpose(array: number[][]): number[][] {
+    return array[0].map((_, colIndex) => array.map(row => row[colIndex]));
+  }
+
   function drawWaves() {
-    const svg = d3.select(svgContainer)
+  const svg = d3.select(svgContainer)
       .attr("viewBox", `0 0 ${width} ${height}`)
       .attr("preserveAspectRatio", "xMidYMid meet");
 
     svg.selectAll("*").remove();
 
-    const stack = d3.stack().keys(d3.range(layers)).offset(d3.stackOffsetWiggle);
-    const stackedData = stack(d3.transpose(data));
+    stack = d3.stack().keys(d3.range(layers)).offset(d3.stackOffsetWiggle);
+    const shiftedData = data.map(layer => layer.map((_, i) => layer[(i + Math.floor(offset)) % n]));
+    const stackedData = stack(transpose(shiftedData));
 
-    const x = d3.scaleLinear().domain([0, n - 1]).range([0, width]);
-    const y = d3.scaleLinear()
-      .domain([d3.min(stackedData.flat(2)) || 0, d3.max(stackedData.flat(2)) || 1])
+    x = d3.scaleLinear().domain([0, n - 1]).range([0, width]);
+    const minY = d3.min(stackedData.flat(2)) ?? 0; // Fallback to 0 if undefined
+    const maxY = d3.max(stackedData.flat(2)) ?? 1; // Fallback to 1 if undefined
+    y = d3.scaleLinear()
+      .domain([minY, maxY])
       .range([height, 0]);
 
-    const area = d3.area<[number, number]>()
+    area = d3.area<[number, number]>()
       .x((_, i) => x(i))
       .y0(d => y(d[0]))
       .y1(d => y(d[1]))
       .curve(d3.curveCardinal);
 
-    const palette = getPalette(displayRR);
+    line = d3.line<[number, number]>()
+      .x((_, i) => x(i))
+      .y(d => y(d[1]))
+      .curve(d3.curveCardinal);
 
-    svg.selectAll("path")
+    // Initial wave paths
+    paths = svg.selectAll(".wave-path")
       .data(stackedData)
-      .join("path")
-      .attr("fill", (_, i) => palette[i % palette.length])
-      .attr("opacity", 0.88)
-      .attr("d", area);
+      .enter()
+      .append("path")
+      .attr("class", "wave-path")
+      .attr("fill-opacity", 1)
+      .attr("d", area)
+      .attr("fill", (_, i) => getPalette(displayRR)[i % getPalette(displayRR).length]);
+
+    // Initial pulse line
+    pulseLine = svg.append("path")
+      .datum(stackedData[stackedData.length - 1])
+      .attr("class", "pulse-line")
+      .attr("fill", "none")
+      .attr("stroke-width", 2)
+      .attr("stroke-opacity", 1)
+      .attr("filter", "url(#glow)")
+      .attr("d", line)
+      .attr("stroke", getPalette(displayRR)[0]);
+
+    // Start the animation loop
+    requestAnimationFrame(animate);
+  }
+
+  function animate(time: number) {
+    const delta = (time - lastTime) / 1000;
+    if (delta < 1 / 80) {
+      requestAnimationFrame(animate);
+      return;
+    }
+    lastTime = time;
+
+    const palette = getPalette(displayRR);
+    offset = (offset + 0.01 * delta * (80 / pulseSpeed)) % n; // Keep fractional offset
+
+    // Interpolate wave positions for smoother flow
+    const newShiftedData = data.map(layer => {
+      return layer.map((_, i) => {
+        const index = (i + offset) % n;
+        const floorIndex = Math.floor(index);
+        const frac = index - floorIndex;
+        const nextIndex = (floorIndex + 1) % n;
+        // Linearly interpolate between two points
+        return layer[floorIndex] * (1 - frac) + layer[nextIndex] * frac;
+      });
+    });
+    const newStackedData = stack(transpose(newShiftedData));
+
+    y.domain([d3.min(newStackedData.flat(2)) || 0, d3.max(newStackedData.flat(2)) || 1]);
+
+    paths.data(newStackedData)
+      .attr("d", area)
+      .attr("fill", (_, i) => palette[i % palette.length]);
+
+    const phase = (time % (pulseSpeed * 1000)) / (pulseSpeed * 1000);
+    const spike = phase < 0.5 ? phase * 0.4 : (1 - phase) * 0.4;
+    pulseLine.datum(newStackedData[newStackedData.length - 1])
+      .attr("stroke", palette[0])
+      .attr("d", d => {
+        const scaledData = d.map(point => [point[0], point[1] * (1 + spike)]);
+        return line(scaledData);
+      });
+
+    // Animate motion blur on pulseLine
+    d3.select("#glow .blurValues")
+      .transition()
+      .duration(pulseSpeed * 1000 / 2)
+      .ease(d3.easeCubic)
+      .attrTween("stdDeviation", () => d3.interpolateString("0.1 0", "8 0"))
+      .transition()
+      .duration(pulseSpeed * 1000 / 2)
+      .ease(d3.easeCubic)
+      .attrTween("stdDeviation", () => d3.interpolateString("8 0", "0.1 0"));
+
+    requestAnimationFrame(animate);
   }
 
   async function fetchData() {
@@ -220,7 +186,6 @@
 
         const bumpCount = Math.floor((displayRR - 40) / 5);
         data = d3.range(layers).map(() => bumps(n, bumpCount));
-        drawWaves();
 
         // ❤️ Pulse heart icon
         const heartbeat = document.getElementById("heartbeat") as HTMLElement;
@@ -233,6 +198,8 @@
             heartbeat.style.transform = "scale(1)";
           }, 200);
         }
+
+        drawWaves();
       }
     } catch (err) {
       console.error("Fetch error:", err);
@@ -240,29 +207,63 @@
   }
 
   onMount(() => {
-    data = Array.from({ length: layers }, () => bumps(n, 5));
+    data = Array.from({ length: layers }, () => bumps(n, 45));
     drawWaves();
-    const interval = setInterval(fetchData, 1500);
+    const interval = setInterval(fetchData, 1000);
     return () => clearInterval(interval);
   });
 </script>
 
+<style>
+  .container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    background: #1a1a1a;
+    color: #fff;
+    font-family: Arial, sans-serif;
+  }
 
+  .heart-rate {
+    font-size: 24px;
+    margin-bottom: 20px;
+  }
 
-<div class="p-4 bg-white rounded shadow w-full max-w-5xl mx-auto">
-  <svg bind:this={svgContainer} class="w-full h-[300px]"></svg>
+  .svg-container {
+    width: 100%;
+    max-width: 1000px;
+    height: 600px;
+  }
+</style>
+
+<div class="container">
+  <div class="heart-rate">Heart Rate: {Math.round(displayRR)} BPM</div>
+  <svg bind:this={svgContainer} class="svg-container">
+    <defs>
+      <filter id="glow">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="blur"/>
+        <feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7" result="glow"/>
+        <feMerge>
+          <feMergeNode in="glow"/>
+          <feMergeNode in="SourceGraphic"/>
+        </feMerge>
+      </filter>
+    </defs>
+  </svg>
 </div>
 
 <div class="flex flex-col items-center mt-6 space-y-2">
   <h1 class="text-center text-4xl font-extrabold tracking-tight text-purple-900 md:text-5xl lg:text-6xl">
-    RR: {Math.round(displayRR)} ms
+    Heart Rate: {Math.round(displayRR)} BPM
   </h1>
 
   <svg
     id="heartbeat"
     xmlns="http://www.w3.org/2000/svg"
     class="w-12 h-12 transition-transform duration-200 ease-in-out"
-    viewBox="0 0  120"
+    viewBox="0 0"
     fill="currentColor"
   >
     <path
